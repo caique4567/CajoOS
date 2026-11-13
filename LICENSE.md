@@ -1,0 +1,2 @@
+CajoOS is based on XD OS, created by CodingWalaXD. The original base is available at https://github.com/eklavya-raj/xdos and is distributed under the MIT license above. We thank CodingWalaXD for making the original project available.
+A small x86 desktop operating system in Assembly, based on [XD OS](https://github.com/eklavya-raj/xdos), by CodingWalaXD. The reference project shows a functional desktop in an image of about 19 KB.

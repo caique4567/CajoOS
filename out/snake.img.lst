@@ -1,0 +1,290 @@
+     1                                  bits 16
+     2                                  org 0x7C00
+     3                                  
+     4                                  start:
+     5 00000000 31C0                        xor ax, ax
+     6 00000002 8ED8                        mov ds, ax
+     7 00000004 B800A0                      mov ax, 0xA000
+     8 00000007 8EC0                        mov es, ax
+     9                                  
+    10                                  restart:
+    11 00000009 C706[7A02]0300              mov word [length], 3
+    12 0000000F C706[8202]1D01              mov word [snake], 285
+    13 00000015 C706[8402]1C01              mov word [snake+2], 284
+    14 0000001B C706[8602]1B01              mov word [snake+4], 283
+    15 00000021 C606[7602]01                mov byte [direction], 1
+    16 00000026 C606[7702]FF                mov byte [last_key], 0xFF
+    17 0000002B C606[7802]0C                mov byte [step_wait], 12
+    18 00000030 E81C01                      call place_food
+    19 00000033 E84301                      call draw_game
+    20                                  
+    21                                  game_loop:
+    22 00000036 E81800                      call read_key
+    23 00000039 FE0E[7802]                  dec byte [step_wait]
+    24 0000003D 750F                        jnz .yield
+    25 0000003F C606[7802]0C                mov byte [step_wait], 12
+    26 00000044 E87000                      call advance_snake
+    27 00000047 0F82BB01                    jc game_over
+    28 0000004B E82B01                      call draw_game
+    29                                  .yield:
+    30                                      ; Let the kernel run between game updates instead of busy-polling.
+    31 0000004E F4                          hlt
+    32 0000004F EBE5                        jmp game_loop
+    33                                  
+    34                                  read_key:
+    35 00000051 BA6000                      mov dx, 0x60
+    36 00000054 EC                          in al, dx
+    37 00000055 3A06[7702]                  cmp al, [last_key]
+    38 00000059 745B                        je .done
+    39 0000005B A2[7702]                    mov [last_key], al
+    40 0000005E A880                        test al, 0x80
+    41 00000060 7554                        jnz .done
+    42 00000062 3C48                        cmp al, 0x48
+    43 00000064 741D                        je .up
+    44 00000066 3C11                        cmp al, 0x11
+    45 00000068 7419                        je .up
+    46 0000006A 3C4D                        cmp al, 0x4D
+    47 0000006C 7422                        je .right
+    48 0000006E 3C20                        cmp al, 0x20
+    49 00000070 741E                        je .right
+    50 00000072 3C50                        cmp al, 0x50
+    51 00000074 7427                        je .down
+    52 00000076 3C1F                        cmp al, 0x1F
+    53 00000078 7423                        je .down
+    54 0000007A 3C4B                        cmp al, 0x4B
+    55 0000007C 742C                        je .left
+    56 0000007E 3C1E                        cmp al, 0x1E
+    57 00000080 7428                        je .left
+    58 00000082 C3                          ret
+    59                                  .up:
+    60 00000083 803E[7602]02                cmp byte [direction], 2
+    61 00000088 742C                        je .done
+    62 0000008A C606[7602]00                mov byte [direction], 0
+    63 0000008F C3                          ret
+    64                                  .right:
+    65 00000090 803E[7602]03                cmp byte [direction], 3
+    66 00000095 741F                        je .done
+    67 00000097 C606[7602]01                mov byte [direction], 1
+    68 0000009C C3                          ret
+    69                                  .down:
+    70 0000009D 803E[7602]00                cmp byte [direction], 0
+    71 000000A2 7412                        je .done
+    72 000000A4 C606[7602]02                mov byte [direction], 2
+    73 000000A9 C3                          ret
+    74                                  .left:
+    75 000000AA 803E[7602]01                cmp byte [direction], 1
+    76 000000AF 7405                        je .done
+    77 000000B1 C606[7602]03                mov byte [direction], 3
+    78                                  .done:
+    79 000000B6 C3                          ret
+    80                                  
+    81                                  advance_snake:
+    82 000000B7 A1[8202]                    mov ax, [snake]
+    83 000000BA 31D2                        xor dx, dx
+    84 000000BC BB1E00                      mov bx, 30
+    85 000000BF F7F3                        div bx
+    86 000000C1 803E[7602]00                cmp byte [direction], 0
+    87 000000C6 7418                        je .up
+    88 000000C8 803E[7602]01                cmp byte [direction], 1
+    89 000000CD 741D                        je .right
+    90 000000CF 803E[7602]02                cmp byte [direction], 2
+    91 000000D4 7421                        je .down
+    92                                  .left:
+    93 000000D6 85D2                        test dx, dx
+    94 000000D8 7473                        jz .dead
+    95 000000DA A1[8202]                    mov ax, [snake]
+    96 000000DD 48                          dec ax
+    97 000000DE EB22                        jmp .candidate
+    98                                  .up:
+    99 000000E0 85C0                        test ax, ax
+   100 000000E2 7469                        jz .dead
+   101 000000E4 A1[8202]                    mov ax, [snake]
+   102 000000E7 83E81E                      sub ax, 30
+   103 000000EA EB16                        jmp .candidate
+   104                                  .right:
+   105 000000EC 83FA1D                      cmp dx, 29
+   106 000000EF 735C                        jae .dead
+   107 000000F1 A1[8202]                    mov ax, [snake]
+   108 000000F4 40                          inc ax
+   109 000000F5 EB0B                        jmp .candidate
+   110                                  .down:
+   111 000000F7 83F811                      cmp ax, 17
+   112 000000FA 7351                        jae .dead
+   113 000000FC A1[8202]                    mov ax, [snake]
+   114 000000FF 83C01E                      add ax, 30
+   115                                  .candidate:
+   116 00000102 A3[7E02]                    mov [next_head], ax
+   117 00000105 89C3                        mov bx, ax
+   118 00000107 BE[8202]                    mov si, snake
+   119 0000010A 8B0E[7A02]                  mov cx, [length]
+   120                                  .collision:
+   121 0000010E AD                          lodsw
+   122 0000010F 39D8                        cmp ax, bx
+   123 00000111 743A                        je .dead
+   124 00000113 E2F9                        loop .collision
+   125 00000115 A1[7E02]                    mov ax, [next_head]
+   126 00000118 3B06[7C02]                  cmp ax, [food]
+   127 0000011C 750F                        jne .shift
+   128 0000011E 813E[7A02]8000              cmp word [length], 128
+   129 00000124 7307                        jae .shift
+   130 00000126 FF06[7A02]                  inc word [length]
+   131 0000012A E82200                      call place_food
+   132                                  .shift:
+   133 0000012D 8B0E[7A02]                  mov cx, [length]
+   134 00000131 49                          dec cx
+   135 00000132 7411                        jz .head
+   136 00000134 89CE                        mov si, cx
+   137 00000136 D1E6                        shl si, 1
+   138                                  .tail:
+   139 00000138 8B84[8002]                  mov ax, [snake+si-2]
+   140 0000013C 8984[8202]                  mov [snake+si], ax
+   141 00000140 83EE02                      sub si, 2
+   142 00000143 E2F3                        loop .tail
+   143                                  .head:
+   144 00000145 A1[7E02]                    mov ax, [next_head]
+   145 00000148 A3[8202]                    mov [snake], ax
+   146 0000014B F8                          clc
+   147 0000014C C3                          ret
+   148                                  .dead:
+   149 0000014D F9                          stc
+   150 0000014E C3                          ret
+   151                                  
+   152                                  place_food:
+   153                                  .retry:
+   154 0000014F A1[8002]                    mov ax, [seed]
+   155 00000152 BB5562                      mov bx, 25173
+   156 00000155 F7E3                        mul bx
+   157 00000157 051936                      add ax, 13849
+   158 0000015A A3[8002]                    mov [seed], ax
+   159 0000015D 31D2                        xor dx, dx
+   160 0000015F BB1C02                      mov bx, 540
+   161 00000162 F7F3                        div bx
+   162 00000164 8916[7C02]                  mov [food], dx
+   163 00000168 BE[8202]                    mov si, snake
+   164 0000016B 8B0E[7A02]                  mov cx, [length]
+   165 0000016F 89D3                        mov bx, dx
+   166                                  .check:
+   167 00000171 AD                          lodsw
+   168 00000172 39D8                        cmp ax, bx
+   169 00000174 74D9                        je .retry
+   170 00000176 E2F9                        loop .check
+   171 00000178 C3                          ret
+   172                                  
+   173                                  draw_game:
+   174 00000179 31FF                        xor di, di
+   175 0000017B B900FA                      mov cx, 64000
+   176 0000017E B001                        mov al, 1
+   177 00000180 F3AA                        rep stosb
+   178 00000182 BA0000                      mov dx, 0x0000
+   179 00000185 BE[3302]                    mov si, title
+   180 00000188 E86600                      call print_text
+   181 0000018B BA0001                      mov dx, 0x0100
+   182 0000018E BE[3E02]                    mov si, controls
+   183 00000191 E85D00                      call print_text
+   184 00000194 BE[8202]                    mov si, snake
+   185 00000197 8B0E[7A02]                  mov cx, [length]
+   186                                  .body:
+   187 0000019B AD                          lodsw
+   188 0000019C B30A                        mov bl, 10
+   189 0000019E E80B00                      call draw_cell
+   190 000001A1 E2F8                        loop .body
+   191 000001A3 A1[7C02]                    mov ax, [food]
+   192 000001A6 B30C                        mov bl, 12
+   193 000001A8 E80100                      call draw_cell
+   194 000001AB C3                          ret
+   195                                  
+   196                                  draw_cell:
+   197 000001AC 881E[7902]                  mov [draw_color], bl
+   198 000001B0 50                          push ax
+   199 000001B1 53                          push bx
+   200 000001B2 51                          push cx
+   201 000001B3 52                          push dx
+   202 000001B4 56                          push si
+   203 000001B5 57                          push di
+   204 000001B6 31D2                        xor dx, dx
+   205 000001B8 BB1E00                      mov bx, 30
+   206 000001BB F7F3                        div bx
+   207 000001BD 89D6                        mov si, dx
+   208 000001BF C1E603                      shl si, 3
+   209 000001C2 83C628                      add si, 40
+   210 000001C5 89C2                        mov dx, ax
+   211 000001C7 C1E008                      shl ax, 8
+   212 000001CA C1E206                      shl dx, 6
+   213 000001CD 01D0                        add ax, dx
+   214 000001CF 050028                      add ax, 10240
+   215 000001D2 01F0                        add ax, si
+   216 000001D4 89C7                        mov di, ax
+   217 000001D6 BA0800                      mov dx, 8
+   218                                  .row:
+   219 000001D9 52                          push dx
+   220 000001DA A0[7902]                    mov al, [draw_color]
+   221 000001DD B90800                      mov cx, 8
+   222 000001E0 F3AA                        rep stosb
+   223 000001E2 81C73801                    add di, 312
+   224 000001E6 5A                          pop dx
+   225 000001E7 4A                          dec dx
+   226 000001E8 75EF                        jnz .row
+   227 000001EA 5F                          pop di
+   228 000001EB 5E                          pop si
+   229 000001EC 5A                          pop dx
+   230 000001ED 59                          pop cx
+   231 000001EE 5B                          pop bx
+   232 000001EF 58                          pop ax
+   233 000001F0 C3                          ret
+   234                                  
+   235                                  print_text:
+   236 000001F1 B402                        mov ah, 2
+   237 000001F3 30FF                        xor bh, bh
+   238 000001F5 CD10                        int 0x10
+   239 000001F7 BB0F00                      mov bx, 0x000F
+   240                                  .next:
+   241 000001FA AC                          lodsb
+   242 000001FB 84C0                        test al, al
+   243 000001FD 7406                        jz .done
+   244 000001FF B40E                        mov ah, 0x0E
+   245 00000201 CD10                        int 0x10
+   246 00000203 EBF5                        jmp .next
+   247                                  .done:
+   248 00000205 C3                          ret
+   249                                  
+   250                                  game_over:
+   251 00000206 BA000B                      mov dx, 0x0B00
+   252 00000209 BE[5602]                    mov si, over_text
+   253 0000020C E8E2FF                      call print_text
+   254 0000020F BA000C                      mov dx, 0x0C00
+   255 00000212 BE[6202]                    mov si, restart_text
+   256 00000215 E8D9FF                      call print_text
+   257 00000218 BA6000                      mov dx, 0x60
+   258 0000021B EC                          in al, dx
+   259 0000021C A2[7702]                    mov [last_key], al
+   260                                  .wait:
+   261 0000021F EC                          in al, dx
+   262 00000220 3A06[7702]                  cmp al, [last_key]
+   263 00000224 7503                        jne .new_key
+   264 00000226 F4                          hlt
+   265 00000227 EBF6                        jmp .wait
+   266                                  .new_key:
+   267 00000229 A2[7702]                    mov [last_key], al
+   268 0000022C A880                        test al, 0x80
+   269 0000022E 75EF                        jnz .wait
+   270 00000230 E9D6FD                      jmp restart
+   271                                  
+   272 00000233 43414A4F20534E414B-     title        db 'CAJO SNAKE', 0
+   272 0000023C 4500               
+   273 0000023E 5345544153202F2057-     controls     db 'SETAS / WASD PARA MOVER', 0
+   273 00000247 415344205041524120-
+   273 00000250 4D4F56455200       
+   274 00000256 46494D204445204A4F-     over_text    db 'FIM DE JOGO', 0
+   274 0000025F 474F00             
+   275 00000262 5052455353494F4E45-     restart_text db 'PRESSIONE UMA TECLA', 0
+   275 0000026B 20554D41205445434C-
+   275 00000274 4100               
+   276 00000276 00                      direction    db 0
+   277 00000277 00                      last_key     db 0
+   278 00000278 00                      step_wait    db 0
+   279 00000279 00                      draw_color   db 0
+   280 0000027A 0000                    length       dw 0
+   281 0000027C 0000                    food         dw 0
+   282 0000027E 0000                    next_head    dw 0
+   283 00000280 1572                    seed         dw 0x7215
+   284 00000282 0000<rep 80h>           snake        times 128 dw 0

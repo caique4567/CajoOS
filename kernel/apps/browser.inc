@@ -1,0 +1,1018 @@
+WORDS   equ 0x2400000 ; x y text w link head
+WTEXT   equ 0x2500000
+LINKS   equ 0x2600000
+WSZ     equ 24
+MAXW    equ 40000 ;youtube was eating the page tables
+BCTOP   equ 38
+ACOL    equ 0x1A5FD0
+HCOL    equ 0x20243A
+TCOL    equ 0x30344A
+
+; host + path, 80 or 443
+parse_url:
+    and dword [tls_on], 0
+    mov word [dport], 0x5000
+    cmp dword [esi], 'http'
+    jne .h
+    cmp dword [esi+4], 's://'
+    jne .hp
+    mov byte [tls_on], 1
+    mov word [dport], 0xBB01
+    add esi, 8
+    jmp .h
+.hp:
+    cmp dword [esi+3], 'p://'
+    jne .h
+    add esi, 7
+.h:
+    mov edi, b_host
+.c:
+    lodsb
+    cmp al, '/'
+    je .p
+    cmp al, '?'
+    je .q
+    test al, al
+    jz .e
+    stosb
+    jmp .c
+.e:
+    xor al, al
+    stosb
+    mov word [b_path], '/'
+    xor eax, eax
+    ret
+.q:
+    xor al, al
+    stosb
+    dec esi
+    mov edi, b_path
+    mov al, '/'
+    stosb
+    call scopy
+    stosb
+    xor eax, eax
+    ret
+.p:
+    xor al, al
+    stosb
+    dec esi
+    mov edi, b_path
+    call scopy
+    xor al, al
+    stosb
+    xor eax, eax
+    ret
+
+; follows 3 redirects max
+browser_go:
+    and dword [b_go], 0
+    and dword [b_redir], 0
+    mov dword [pagebuf], PAGE
+    mov dword [req_m], r_getm
+    mov dword [req_h], r_none
+    and dword [req_bl], 0
+.again:
+    mov esi, b_addr
+    call parse_url
+    mov ebx, [tls_on]
+    mov [b_tls], ebx
+    test eax, eax
+    jnz .err
+    call net_get
+    test eax, eax
+    jnz .err
+    mov esi, PAGE
+    mov ecx, [pagelen]
+    mov byte [esi+ecx], 0
+    cmp byte [esi+9], '3' ; 3xx?
+    jne .body
+    call find_location
+    test eax, eax
+    jz .body
+    cmp dword [eax], 'http'
+    jne .body
+    inc dword [b_redir]
+    cmp dword [b_redir], 3
+    ja .body
+    mov esi, eax
+    mov edi, b_addr
+.cp:
+    lodsb
+    cmp al, 13
+    je .cpe
+    stosb
+    jmp .cp
+.cpe:
+    mov byte [edi], 0
+    mov ecx, 0
+    jmp .again
+.body:
+    mov esi, PAGE
+    call fix_body
+    mov dword [b_status], s_done
+    cmp dword [b_tls], 0
+    je .st
+    mov dword [b_status], s_unver
+.st:
+    mov [b_body], esi
+    call layout
+    mov dword [dirty], 1
+    ret
+.err:
+    mov [b_status], eax
+    mov dword [dirty], 1
+    ret
+
+body_start:
+    cmp byte [esi], 0
+    je .x
+    cmp dword [esi], 0x0A0D0A0D
+    je .f
+    inc esi
+    jmp body_start
+.f:
+    add esi, 4
+.x:
+    ret
+
+; chunked -> plain, in place
+fix_body:
+    push esi
+    call body_start
+    pop edi
+.f:
+    cmp edi, esi
+    jae .x
+    mov eax, [edi]
+    or eax, 0x20202020
+    cmp eax, 'chun'
+    jne .n
+    mov eax, [edi+3]
+    or eax, 0x20202020
+    cmp eax, 'nked'
+    je .dc
+.n:
+    inc edi
+    jmp .f
+.dc:
+    push esi
+    mov edi, esi
+.ch:
+    xor ecx, ecx
+.h:
+    movzx eax, byte [esi]
+    inc esi
+    mov edx, eax
+    or dl, 0x20
+    sub dl, '0'
+    cmp dl, 10
+    jb .hd
+    sub dl, 39
+    cmp dl, 16
+    jae .sl
+.hd:
+    shl ecx, 4
+    movzx edx, dl
+    add ecx, edx
+    jmp .h
+.sl:
+    test al, al
+    jz .end
+    cmp al, 10
+    je .dat
+    lodsb
+    jmp .sl
+.dat:
+    jecxz .end
+.cp:
+    lodsb
+    test al, al
+    jz .end
+    stosb
+    loop .cp
+    lodsb
+    test al, al
+    jz .end
+    lodsb
+    test al, al
+    jz .end
+    jmp .ch
+.end:
+    mov byte [edi], 0
+    pop esi
+.x:
+    ret
+
+curl_job:
+    mov dword [pagebuf], CPAGE
+    mov dword [req_m], c_meth
+    mov dword [req_h], c_hdrs
+    mov dword [req_b], c_body
+    mov eax, [c_blen]
+    mov [req_bl], eax
+    mov esi, c_url
+    call parse_url
+    test eax, eax
+    jnz .err
+    call net_get
+    test eax, eax
+    jnz .err
+    mov esi, CPAGE
+    mov ecx, [pagelen]
+    mov byte [esi+ecx], 0
+    call fix_body
+    cmp byte [c_inc], 0
+    je .p
+    mov esi, CPAGE
+.p:
+    lodsb
+    test al, al
+    jz .end
+    cmp al, 13
+    je .p
+    call tputc
+    jmp .p
+.err:
+    mov esi, eax
+    call tputs
+.end:
+    cmp dword [tcol], 0
+    je .nl
+    mov al, 10
+    call tputc
+.nl:
+    ; parse_url clobbered these
+    mov esi, b_addr
+    call parse_url
+    mov dword [dirty], 1
+    jmp prompt
+
+find_location:
+    mov esi, PAGE
+.l:
+    cmp byte [esi], 0
+    je .no
+    cmp dword [esi], 0x0A0D0A0D
+    je .no
+    mov eax, [esi]
+    or eax, 0x20202020
+    cmp eax, 'loca'
+    jne .n
+    mov eax, [esi+4]
+    or eax, 0x20202020
+    cmp eax, 'tion'
+    jne .n
+    cmp byte [esi+8], ':'
+    jne .n
+    lea eax, [esi+9]
+.sp:
+    cmp byte [eax], ' '
+    jne .x
+    inc eax
+    jmp .sp
+.n:
+    inc esi
+    jmp .l
+.no:
+    xor eax, eax
+.x:
+    ret
+
+newline:
+    cmp dword [l_x], 0
+    je .x
+    and dword [l_x], 0
+    add dword [l_y], 18
+.x:
+    ret
+
+gapline:
+    call newline
+    add dword [l_y], 10
+    ret
+
+flush:
+    push esi
+    push eax
+    mov edi, [l_wp]
+    cmp edi, [l_ws]
+    je .x
+    mov byte [edi], 0
+    inc edi
+    mov [l_wp], edi
+    mov esi, [l_ws]
+    call twidth
+    mov ebx, eax
+    add eax, [l_x]
+    cmp eax, [b_w]
+    jbe .fit
+    cmp dword [l_x], 0
+    je .fit
+    call newline
+.fit:
+    mov edi, [l_n]
+    cmp edi, MAXW
+    jae .full
+    imul edi, WSZ
+    add edi, WORDS
+    mov eax, [l_x]
+    mov [edi], eax
+    mov eax, [l_y]
+    mov [edi+4], eax
+    mov [edi+8], esi
+    mov [edi+12], ebx
+    mov eax, [l_link]
+    mov [edi+16], eax
+    mov eax, [l_head]
+    mov [edi+20], eax
+    inc dword [l_n]
+.full:
+    lea eax, [ebx+4]
+    add [l_x], eax
+    mov eax, [l_wp]
+    mov [l_ws], eax
+.x:
+    pop eax
+    pop esi
+    ret
+
+tagis:
+    push esi
+    push edi
+    mov edi, l_tag
+.l:
+    mov al, [esi]
+    test al, al
+    jz .end
+    cmp al, [edi]
+    jne .x
+    inc esi
+    inc edi
+    jmp .l
+.end:
+    cmp byte [edi], 0
+.x:
+    pop edi
+    pop esi
+    ret
+
+; no css, no images
+layout:
+    and dword [l_x], 0
+    and dword [l_y], 0
+    and dword [l_n], 0
+    or dword [l_link], -1
+    and dword [l_head], 0
+    and dword [l_nl], 0
+    and dword [b_scroll], 0
+    mov dword [l_ws], WTEXT
+    mov dword [l_wp], WTEXT
+.c:
+    lodsb
+    test al, al
+    jz .done
+    cmp al, '<'
+    je .tag
+    cmp al, '&'
+    je .ent
+    cmp al, ' '
+    jbe .ws
+    cmp al, 127
+    jae .c
+.put:
+    mov edi, [l_wp]
+    stosb
+    mov [l_wp], edi
+    jmp .c
+.ws:
+    call flush
+    jmp .c
+.done:
+    call flush
+    mov eax, [l_y]
+    add eax, 40
+    mov [b_doch], eax
+    ret
+.ent:
+  ;entities
+    cmp byte [esi], '#'
+    je .num
+    mov eax, [esi]
+    cmp eax, 'quot'
+    je .quot
+    cmp eax, 'apos'
+    je .apos
+    cmp eax, 'amp;'
+    je .amp
+    and eax, 0xFFFFFF
+    cmp eax, 'lt;'
+    je .lt
+    cmp eax, 'gt;'
+    je .gt
+    mov eax, [esi]
+    cmp eax, 'nbsp'
+    je .nb
+    mov al, '&'
+    jmp .put
+.amp:
+    add esi, 4
+    mov al, '&'
+    jmp .put
+.lt:
+    add esi, 3
+    mov al, '<'
+    jmp .put
+.gt:
+    add esi, 3
+    mov al, '>'
+    jmp .put
+.nb:
+    add esi, 5
+    jmp .ws
+.quot:
+    add esi, 5
+    mov al, '"'
+    jmp .put
+.apos:
+    add esi, 5
+    mov al, 39
+    jmp .put
+.num:
+    inc esi
+    xor edx, edx
+    mov ebx, 10
+    mov al, [esi]
+    or al, 0x20
+    cmp al, 'x'
+    jne .dl
+    mov ebx, 16
+    inc esi
+.dl:
+    movzx eax, byte [esi]
+    inc esi
+    cmp al, ';'
+    je .de
+    or al, 0x20
+    sub al, '0'
+    cmp al, 10
+    jb .dv
+    sub al, 39
+.dv:
+    cmp eax, ebx
+    jae .bad
+    imul edx, ebx
+    add edx, eax
+    cmp edx, 0x10FFFF
+    jbe .dl
+.bad:
+    dec esi
+    mov al, '?'
+    jmp .put
+.de:
+    cmp edx, 32
+    jb .ws
+    mov eax, edx
+    cmp edx, 127
+    jb .put
+    cmp edx, 160
+    je .ws
+    mov al, '-'
+    cmp edx, 8211
+    je .put
+    cmp edx, 8212
+    je .put
+    mov al, 39
+    cmp edx, 8216
+    je .put
+    cmp edx, 8217
+    je .put
+    mov al, '"'
+    cmp edx, 8220
+    je .put
+    cmp edx, 8221
+    je .put
+    mov al, '?'
+    jmp .put
+.tag:
+  ; script/style/title get skipped
+    call flush
+    xor ebx, ebx
+    cmp byte [esi], '/'
+    jne .nm
+    inc esi
+    mov ebx, 1
+.nm:
+    mov edi, l_tag
+    mov ecx, 9
+.n:
+    mov al, [esi]
+    cmp al, ' '
+    jbe .ne
+    cmp al, '>'
+    je .ne
+    cmp al, '/'
+    je .ne
+    or al, 0x20
+    stosb
+    inc esi
+    dec ecx
+    jnz .n
+.ne:
+    mov byte [edi], 0
+    push esi
+    mov esi, t_script
+    call tagis
+    pop esi
+    je .skip
+    push esi
+    mov esi, t_style
+    call tagis
+    pop esi
+    je .skip
+    push esi
+    mov esi, t_title
+    call tagis
+    pop esi
+    je .skip
+    cmp byte [l_tag], 'h'
+    jne .nh
+    mov al, [l_tag+1]
+    cmp al, '1'
+    jb .nh
+    cmp al, '6'
+    ja .nh
+    call gapline
+    mov eax, 1
+    sub eax, ebx
+    mov [l_head], eax
+    jmp .end
+.nh:
+    cmp word [l_tag], 'a'
+    je .anchor
+    push esi
+    mov esi, blocks
+.bl:
+    cmp byte [esi], 0
+    je .blx
+    call tagis
+    je .blk
+.bs:
+    lodsb
+    test al, al
+    jnz .bs
+    jmp .bl
+.blk:
+    pop esi
+    call newline
+    jmp .end
+.blx:
+    pop esi
+.end:
+    lodsb
+    test al, al
+    jz .done
+    cmp al, '>'
+    jne .end
+    jmp .c
+.skip:
+    test ebx, ebx
+    jnz .end
+.sk:
+    lodsb
+    test al, al
+    jz .done
+    cmp al, '<'
+    jne .sk
+    cmp byte [esi], '/'
+    jne .sk
+    jmp .end
+.anchor:
+    test ebx, ebx
+    jz .open
+    mov dword [l_link], -1
+    jmp .end
+.open:
+    mov eax, [esi]
+    cmp al, '>'
+    je .end
+    or eax, 0x20202000
+    cmp eax, 0x65726820
+    je .h1
+    cmp eax, 0x65726809
+    je .h1
+    inc esi
+    jmp .open
+.h1:
+    mov eax, [esi+1]
+    or eax, 0x00202020
+    add esi, 5
+.q:
+    lodsb
+    cmp al, '>'
+    je .c
+    test al, al
+    jz .done
+    cmp al, 34
+    je .val
+    cmp al, 39
+    jne .q
+.val:
+    mov bl, al
+    mov edi, [l_nlink]
+    mov eax, edi
+    inc eax
+    cmp eax, 200
+    jae .end
+    mov [l_nlink], eax
+    mov [l_link], edi
+    shl edi, 7
+    add edi, LINKS
+    mov ecx, 126
+.v:
+    lodsb
+    cmp al, bl
+    je .ve
+    test al, al
+    jz .ve
+    stosb
+    dec ecx
+    jnz .v
+.ve:
+    mov byte [edi], 0
+    jmp .end
+
+;8 deep
+push_history:
+    pushad
+    mov eax, [b_hist]
+    cmp eax, 8
+    jae .x
+    shl eax, 7
+    lea edi, [b_stack+eax]
+    mov esi, b_addr
+    call scopy
+    xor al, al
+    stosb
+    inc dword [b_hist]
+.x:
+    popad
+    ret
+
+follow:
+    cmp dword [esi], 'http'
+    je .abs
+    call push_history
+    mov edi, b_addr
+    push esi
+    mov esi, b_url
+    mov dword [b_url], 'http'
+    mov dword [b_url+4], '://'
+    cmp dword [b_tls], 0
+    je .u
+    mov dword [b_url+4], 's://'
+.u:
+    call scopy
+    mov esi, b_host
+    call scopy
+    pop esi
+    cmp byte [esi], '/'
+    je .tail
+    push esi
+    mov esi, b_path
+    mov edx, esi
+.f:
+    lodsb
+    test al, al
+    jz .fe
+    cmp al, '/'
+    jne .f
+    mov edx, esi
+    jmp .f
+.fe:
+    mov esi, b_path
+.cp:
+    cmp esi, edx
+    jae .cd
+    movsb
+    jmp .cp
+.cd:
+    pop esi
+.tail:
+    call scopy
+    xor al, al
+    stosb
+    jmp start_load
+.abs:
+    call push_history
+    mov edi, b_addr
+    call scopy
+    xor al, al
+    stosb
+
+start_load:
+    mov edi, b_addr
+    or ecx, -1
+    xor al, al
+    repne scasb
+    not ecx
+    dec ecx
+    mov [b_len], ecx
+    mov dword [b_status], s_load
+    and dword [l_nlink], 0
+    mov dword [b_go], 1
+    mov dword [dirty], 1
+    ret
+
+key_browser:
+    cmp ebx, 0x48 ; up
+    je .up
+    cmp ebx, 0x50		;down
+    je .dn
+    cmp ebx, 0x49	;  pgup
+    je .pu
+    cmp ebx, 0x51  ;pgdn
+    je .pd
+    cmp al, 10
+    je .go
+    mov edi, b_addr
+    mov ebx, b_len
+    mov ecx, 120
+    jmp edit_key
+.go:
+    call push_history
+    jmp start_load
+.up:
+    mov eax, -44
+    jmp scroll
+.dn:
+    mov eax, 44
+    jmp scroll
+.pu:
+    mov eax, -400
+    jmp scroll
+.pd:
+    mov eax, 400
+
+scroll:
+    add eax, [b_scroll]
+    mov ecx, [b_doch]
+    sub ecx, [b_h]
+    cmp eax, ecx
+    jle .a
+    mov eax, ecx
+.a:
+    cmp eax, 0
+    jge .b
+    xor eax, eax
+.b:
+    mov [b_scroll], eax
+    mov dword [dirty], 1
+    ret
+
+browser_back:
+    mov eax, [b_hist]
+    test eax, eax
+    jz .x
+    dec eax
+    mov [b_hist], eax
+    shl eax, 7
+    lea esi, [b_stack+eax]
+    mov edi, b_addr
+    call scopy
+    xor al, al
+    stosb
+    jmp start_load
+.x:
+    ret
+
+click_browser:
+    cmp edx, 32
+    jae .page
+    cmp ecx, 40
+    jb browser_back
+    ret
+.page:
+    mov eax, [b_w]
+    add eax, 8
+    cmp ecx, eax
+    jb .link
+    mov eax, 400
+    cmp edx, 278
+    jae scroll
+    mov eax, -400
+    jmp scroll
+.link:
+    sub ecx, 10
+    sub edx, BCTOP
+    add edx, [b_scroll]
+    mov esi, WORDS
+    mov ebp, [l_n]
+    test ebp, ebp
+    jz .x
+.w:
+    cmp dword [esi+16], 0
+    jl .n
+    mov eax, edx
+    sub eax, [esi+4]
+    cmp eax, 20
+    jae .n
+    mov eax, ecx
+    sub eax, [esi]
+    cmp eax, [esi+12]
+    jae .n
+    mov esi, [esi+16]
+    shl esi, 7
+    add esi, LINKS
+    jmp follow
+.n:
+    add esi, WSZ
+    dec ebp
+    jnz .w
+.x:
+    ret
+
+draw_browser:
+    pushad
+    mov eax, [cx0]
+    add eax, 4
+    mov ebx, [cy0]
+    add ebx, 2
+    mov ecx, 34
+    mov edx, 26
+    mov esi, 0xDDE3F4
+    call rbox
+    add eax, 13
+    add ebx, 4
+    mov esi, s_back
+    mov edx, HCOL
+    call text
+    mov eax, [cx0]
+    add eax, 44
+    mov ebx, [cy0]
+    add ebx, 2
+    mov ecx, 500
+    mov edx, 26
+    mov esi, 0xFFFFFF
+    call rbox
+    add eax, 10
+    add ebx, 4
+    mov esi, b_addr
+    mov edx, HCOL
+    call text
+    mov esi, [b_status]
+    mov eax, [cx0]
+    add eax, 556
+    mov edx, 0x565C74
+    call text
+    mov eax, [cx0]
+    mov ebx, [cy0]
+    add ebx, 32
+    mov ecx, [b_w]
+    add ecx, 28
+    mov edx, [b_h]
+    add edx, 10
+    mov esi, 0xFFFFFF
+    call rect
+    mov esi, WORDS
+    mov ebp, [l_n]
+    test ebp, ebp
+    jz .bar
+.w:
+    mov ebx, [esi+4]
+    sub ebx, [b_scroll]
+    mov eax, [b_h]
+    sub eax, 20
+    cmp ebx, eax
+    jae .n
+    add ebx, [cy0]
+    add ebx, BCTOP
+    mov eax, [esi]
+    add eax, [cx0]
+    add eax, 10
+    mov edx, TCOL
+    cmp dword [esi+20], 0
+    je .nh
+    mov edx, HCOL
+.nh:
+    cmp dword [esi+16], 0
+    jl .nl
+    mov edx, ACOL
+.nl:
+    push esi
+    mov ecx, [esi+12]
+    mov edi, [esi+20]
+    mov esi, [esi+8]
+    call text
+    test edi, edi
+    jz .plain
+    inc eax
+    call text
+    dec eax
+.plain:
+    pop esi
+    cmp dword [esi+16], 0
+    jl .n
+    push esi
+    add ebx, 16
+    mov edx, 1
+    mov esi, ACOL
+    call rect
+    pop esi
+.n:
+    add esi, WSZ
+    dec ebp
+    jnz .w
+.bar:
+    ; scrollbar
+    mov eax, [b_doch]
+    cmp eax, [b_h]
+    jle .x
+    mov ecx, [b_h]
+    sub ecx, 60
+    mov eax, [b_scroll]
+    imul eax, ecx
+    mov ecx, [b_doch]
+    sub ecx, [b_h]
+    xor edx, edx
+    div ecx
+    mov ebx, eax
+    add ebx, [cy0]
+    add ebx, BCTOP
+    mov eax, [cx0]
+    add eax, [b_w]
+    add eax, 16
+    mov ecx, 8
+    mov edx, 60
+    mov esi, 0xB0B6C8
+    call rbox
+.x:
+    popad
+    ret
+
+browser_resize:
+    mov eax, [wins+A_BROWSE*WSIZE+WW]
+    sub eax, 40
+    mov [b_w], eax
+    mov eax, [wins+A_BROWSE*WSIZE+WH]
+    sub eax, 80
+    mov [b_h], eax
+    and dword [l_nlink], 0
+    mov esi, [b_body]
+
+    jmp layout
+
+browser_init:
+    mov esi, b_home
+    mov edi, PAGE
+    call scopy
+    xor al, al
+    stosb
+    mov esi, PAGE
+    and dword [l_nlink], 0
+    jmp layout
+
+b_go     dd 0
+b_w      dd 700
+b_h      dd 480
+b_body   dd PAGE
+b_redir  dd 0
+b_len    dd 12
+b_doch   dd 0
+b_scroll dd 0
+b_hist   dd 0
+b_status dd s_ready
+l_x      dd 0
+l_y      dd 0
+l_n      dd 0
+l_ws     dd 0
+l_wp     dd 0
+l_link   dd -1
+l_nlink  dd 0
+l_head   dd 0
+l_nl     dd 0
+l_tag    times 12 db 0
+b_url    times 12 db 0
+b_tls    dd 0
+c_hlen   dd 0
+c_blen   dd 0
+c_inc    db 0
+c_k      db 0
+c_mset   db 0
+b_addr   db 'info.cern.ch'
+         times 116 db 0
+b_host   times 128 db 0
+b_path   times 256 db 0
+b_stack  times 8*128 db 0
+t_script db 'script', 0
+t_style  db 'style', 0
+t_title  db 'title', 0
+blocks   db 'p', 0, 'br', 0, 'div', 0, 'li', 0, 'ul', 0, 'ol', 0, 'tr', 0, 'dt', 0, 'dd', 0, 'hr', 0, 'pre', 0, 'center', 0, 'table', 0, 0
+s_ready  db 'Ready', 0
+s_load   db 'Loading...', 0
+s_done   db 'Done', 0
+s_back   db '<', 0
+s_unver  db 'Done, not verified', 0
+b_home   db '<h1>XD Browser</h1><p><a href="http://info.cern.ch/">First website</a>'
+         db '<p><a href="http://example.com/">example.com</a>'
+         db '<p><a href="http://neverssl.com/">neverssl.com</a>', 0

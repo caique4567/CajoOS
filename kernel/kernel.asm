@@ -1,0 +1,1813 @@
+%include "defs.inc"
+bits 32
+org KERNEL
+
+    ;boot sector jumps here
+    call sys_init
+    cld
+    call sha_init
+;build with -dCRYPTOTEST
+%ifdef CRYPTOTEST
+    call crypto_test
+%endif
+    call mouse_init
+    call font_init
+    call wallpaper
+    call paint_clear
+    call browser_init
+    call term_init
+    mov dword [dirty], 1
+
+main:
+    call poll
+    call clock_tick
+    call vm_tick
+    call co_step
+    cmp dword [dirty], 0
+    jne .full
+    ; only the game changed
+    cmp dword [gdirty], 0
+    je main
+    and dword [gdirty], 0
+    call fastframe
+    jmp main
+.full:
+    and dword [dirty], 0
+    and dword [gdirty], 0
+    call scene
+    ; page load on the net stack
+    cmp dword [b_go], 0
+    je main
+    cmp dword [co_on], 0
+    jne main
+    mov eax, browser_go
+    call co_start
+    jmp main
+
+; net code gets its own stack so the desktop doesnt freeze
+co_start:
+    mov [co_job], eax
+    mov dword [co_sp], NETSTACK-36
+    mov dword [NETSTACK-4], co_entry
+    mov dword [co_on], 1
+    ret
+
+co_entry:
+    call [co_job]
+    and dword [co_on], 0
+    call co_switch
+
+co_step:
+    cmp dword [co_on], 0
+    je co_ret
+    mov eax, [ticks]
+    cmp eax, [co_tick]
+    jne .go
+    cmp dword [netirq], 0
+    je co_ret
+.go:
+    mov [co_tick], eax
+    and dword [netirq], 0
+co_switch:
+    pushad
+    xchg esp, [co_sp]
+    popad
+co_ret:
+    ret
+
+fastframe:
+    movzx ebp, byte [zord+NWIN-1]
+    imul eax, ebp, WSIZE
+    lea esi, [wins+eax]
+    mov [cur], esi
+    mov eax, [esi+WX]
+    add eax, 6
+    mov [cx0], eax
+    mov ebx, [esi+WY]
+    add ebx, 30
+    mov [cy0], ebx
+    mov ecx, [esi+WW]
+    sub ecx, 12
+    mov edx, [esi+WH]
+    sub edx, 36
+    pushad
+    call [appdraw+ebp*4]
+    call draw_ctx
+    call cursor
+    popad
+    lea edi, [ebx+edx]
+    cmp edi, BARY
+    jle blit
+    mov edx, BARY
+    sub edx, ebx
+
+blit:
+    call clip
+    jle .x
+    imul esi, ebx, WIDTH
+    add esi, eax
+    lea esi, [BACK+esi*4]
+    imul edi, ebx, 1
+    imul edi, [pitch]
+    lea edi, [edi+eax*4]
+    add edi, [lfb]
+.r:
+    push ecx
+    push esi
+    push edi
+    rep movsd
+    pop edi
+    pop esi
+    pop ecx
+    add esi, WIDTH*4
+    add edi, [pitch]
+    dec edx
+    jnz .r
+.x:
+    ret
+
+; al=key edi=buf ebx=len ecx=max, cf=nothing changed
+edit_key:
+    test al, al
+    jz .no
+    mov edx, [ebx]
+    cmp al, 8
+    jne .add
+    test edx, edx
+    jz .no
+    dec edx
+    jmp .st
+.add:
+    cmp edx, ecx
+    jae .no
+    mov [edi+edx], al
+    inc edx
+.st:
+    mov [ebx], edx
+    mov byte [edi+edx], 0
+    clc
+    ret
+.no:
+    stc
+    ret
+
+kwait:
+    in al, 0x64
+    test al, 2
+    jnz kwait
+    ret
+
+kread:
+    in al, 0x64
+    test al, 1
+    jz kread
+    in al, 0x60
+    ret
+
+kcmd:
+    push eax
+    call kwait
+    pop eax
+    out 0x64, al
+    ret
+
+kdata:
+    push eax
+    call kwait
+    pop eax
+    out 0x60, al
+    ret
+
+mwrite:
+    push eax
+    mov al, 0xD4
+    call kcmd
+    pop eax
+    call kdata
+    call kread
+    ret
+
+mouse_init:
+    mov al, 0xA8
+    call kcmd
+    mov al, 0x20
+    call kcmd
+    call kread
+    and al, 0xDC  ;no irqs,mouse clock on
+    push eax
+    mov al, 0x60
+    call kcmd
+    pop eax
+    call kdata
+    mov al, 0xF6
+    call mwrite
+    ;200,100,80 = wheel on
+    mov esi, imps
+.r:
+    lodsb
+    test al, al
+    jz .id
+    call mwrite
+    jmp .r
+.id:
+    ; id 3=wheel, 4 byte packets
+    mov al, 0xF2
+    call mwrite
+    call kread
+    cmp al, 3
+    jne .e
+    mov byte [mpsz], 4
+.e:
+    mov al, 0xF4	; enable reporting
+    call mwrite
+    ret
+
+poll:
+    in al, 0x64
+    test al, 1
+    jz .out
+    mov ah, al
+    in al, 0x60
+    test ah, 0x20 ;mouse?
+    jnz .mouse
+    call key
+    jmp poll
+.mouse:
+    call mbyte
+    jmp poll
+.out:
+    ret
+
+; bit 3 always set in byte 0, resync on it
+mbyte:
+    mov ebx, [midx]
+    test ebx, ebx
+    jnz .store
+    test al, 8
+    jz .done
+.store:
+    mov [mpkt+ebx], al
+    inc ebx
+    mov [midx], ebx
+    cmp ebx, [mpsz]
+    jb .done
+    and dword [midx], 0
+    ; wheel -> browser
+    movsx eax, byte [mpkt+3]
+    test eax, eax
+    jz .nz
+    movzx ebx, byte [zord+NWIN-1]
+    cmp ebx, A_BROWSE
+    jne .nz
+    imul eax, eax, 66
+    call scroll
+.nz:
+    movzx eax, byte [mpkt+1]
+    test byte [mpkt], 0x10
+    jz .xp
+    or eax, 0xFFFFFF00
+.xp:
+    add [mx], eax
+    movzx eax, byte [mpkt+2]
+    test byte [mpkt], 0x20
+    jz .yp
+    or eax, 0xFFFFFF00
+.yp:
+    sub [my], eax                   ;  y is flipped
+    cmp dword [mx], 0
+    jge .a
+    and dword [mx], 0
+.a:
+    cmp dword [mx], WIDTH-1
+    jle .b
+    mov dword [mx], WIDTH-1
+.b:
+    cmp dword [my], 0
+    jge .c
+    and dword [my], 0
+.c:
+    cmp dword [my], HEIGHT-1
+    jle .d
+    mov dword [my], HEIGHT-1
+.d:
+    mov dword [dirty], 1
+    movzx eax, byte [mpkt]
+    and eax, 3
+    mov ebx, [btn]
+    mov [btn], eax
+    xor ebx, eax
+    test bl, 1
+    jz .right
+    test al, 1
+    jz .up
+    xor ebp, ebp
+    call press
+    jmp .held
+.up:
+    or dword [drag], -1
+    jmp .held
+.right:
+    test bl, al
+    jz .held
+    mov ebp, 1
+    call press
+.held:
+    test byte [btn], 1
+    je .done
+    call dragging
+.done:
+    ret
+
+dragging:
+    mov eax, [drag]
+    cmp eax, 0
+    jl paint_stroke
+    imul eax, WSIZE
+    lea esi, [wins+eax]
+    mov eax, [mx]
+    sub eax, [dragx]
+    mov [esi+WX], eax
+    mov eax, [my]
+    sub eax, [dragy]
+    cmp eax, 0
+    jge .ok
+    xor eax, eax
+.ok:
+    mov [esi+WY], eax
+.out:
+    ret
+
+; ebp=1 for right click
+press:
+    ;context menu open?
+    cmp dword [ctx_items], 0
+    je .noctx
+    call ctx_hit
+    test esi, esi
+    jz .shut
+    mov ecx, [esi+4]
+    test ecx, ecx
+    jz .ret
+    and dword [ctx_items], 0
+    mov eax, [ctx_arg]
+    mov ebx, eax
+    imul esi, eax, WSIZE
+    add esi, wins
+    cmp ecx, NWIN                           ;app id or code
+    jae .run
+    mov eax, ecx
+    jmp open
+.run:
+    jmp ecx
+.shut:
+    and dword [ctx_items], 0
+    mov byte [file_mode], 0
+.noctx:
+    test ebp, ebp
+    jnz .right
+    cmp dword [menu], 0
+    je .nomenu
+    and dword [menu], 0
+    cmp dword [mx], MENUW
+    jae .nomenu
+    mov eax, [my]
+    sub eax, MENUY+56
+    cmp eax, (NWIN+1)*36
+    jae .nomenu
+    xor edx, edx
+    mov ebx, 36
+    div ebx
+    cmp eax, NWIN
+    je shutdown
+    jmp open
+.nomenu:
+    cmp dword [my], BARY
+    jl .wins
+.task:
+    cmp dword [mx], 104
+    jae .bar
+    test ebp, ebp
+    jnz .barmenu
+    mov dword [menu], 1
+    ret
+.bar:
+    mov eax, [mx]
+    sub eax, 112
+    jb .miss
+    xor edx, edx
+    mov ebx, 94
+    div ebx
+    mov ecx, eax
+    xor eax, eax
+.b:
+    imul ebx, eax, WSIZE
+    cmp dword [wins+ebx+WVIS], 0
+    je .bn
+    dec ecx
+    jns .bn
+    test ebp, ebp
+    jnz .winmenu
+    cmp al, [zord+NWIN-1]
+    jne open
+    cmp dword [wins+ebx+WVIS], 1
+    jne open
+    lea esi, [wins+ebx]
+    jmp minimize
+.bn:
+    inc eax
+    cmp eax, NWIN
+    jb .b
+.miss:
+    test ebp, ebp
+    jz .ret
+.barmenu:
+    mov esi, m_bar
+    jmp ctx_show
+.ret:
+    ret
+.right:
+    and dword [menu], 0
+    cmp dword [my], BARY
+    jae .task
+.wins:
+    mov ecx, NWIN-1
+.w:
+    movzx eax, byte [zord+ecx]
+    mov ebx, eax
+    imul eax, WSIZE
+    lea esi, [wins+eax]
+    cmp dword [esi+WVIS], 1
+    jne .next
+    mov edx, [mx]
+    sub edx, [esi+WX]
+    cmp edx, [esi+WW]
+    jae .next
+    mov edi, [my]
+    sub edi, [esi+WY]
+    cmp edi, [esi+WH]
+    jae .next
+    test ebp, ebp
+    jz .left
+    mov eax, ebx
+    call raise
+    cmp edi, 28
+    jb .winmenu
+    mov esi, [appmenu+ebx*4]
+    test esi, esi
+    jz .client
+    jmp ctx_show
+.winmenu:
+    mov esi, m_win
+    jmp ctx_show
+.left:
+    mov eax, ebx
+    call raise
+    cmp edi, 28
+    jae .client
+    ;  x, full screen, minimize
+    mov eax, [esi+WW]
+    sub eax, 30
+    cmp edx, eax
+    jb .notx
+    and dword [esi+WVIS], 0
+    ret
+.notx:
+    sub eax, 22
+    cmp edx, eax
+    jae maximize
+    sub eax, 22
+    cmp edx, eax
+    jae minimize
+    cmp dword [esi+WMAX], 0
+    jne .ret
+    mov [drag], ebx
+    mov [dragx], edx
+    mov [dragy], edi
+    ret
+.client:
+    lea ecx, [edx-6]
+    lea edx, [edi-30]
+    jmp [appclick+ebx*4]
+.next:
+    dec ecx
+    jns .w
+    ;desktop icons
+    mov eax, [my]
+    sub eax, 12
+    xor edx, edx
+    mov ebx, 78
+    div ebx
+    mov esi, m_desk
+    cmp dword [mx], 96
+    jae .desk
+    cmp eax, NWIN
+    jae .desk
+    test ebp, ebp
+    jz open
+    mov esi, m_icon
+.desk:
+    test ebp, ebp
+    jz .ret
+    jmp ctx_show
+
+open:
+    push eax
+    imul eax, WSIZE
+    mov dword [wins+eax+WVIS], 1
+    mov dword [dirty], 1
+    pop eax
+
+raise:
+    pushad
+    xor ecx, ecx
+.f:
+    cmp [zord+ecx], al
+    je .s
+    inc ecx
+    cmp ecx, NWIN-1
+    jb .f
+.s:
+    cmp ecx, NWIN-1
+    jae .e
+    mov bl, [zord+ecx+1]
+    mov [zord+ecx], bl
+    inc ecx
+    jmp .s
+.e:
+    mov [zord+NWIN-1], al
+    popad
+nop_app:
+    ret
+
+minimize:
+    mov dword [esi+WVIS], 2
+    mov al, [zord+NWIN-1]
+    mov ecx, NWIN-1
+.l:
+    mov ah, [zord+ecx-1]
+    mov [zord+ecx], ah
+    loop .l
+    mov [zord], al
+    ret
+
+; old size goes in WSAVE
+maximize:
+    mov edi, ebx
+    shl edi, 4
+    add edi, WSAVE
+    xor dword [esi+WMAX], 1
+    jz .back
+    push esi
+    mov ecx, 4
+    rep movsd
+    pop esi
+    and dword [esi+WX], 0
+    and dword [esi+WY], 0
+    mov dword [esi+WW], WIDTH
+    mov dword [esi+WH], BARY
+    jmp .sized
+.back:
+    xchg esi, edi
+    mov ecx, 4
+    rep movsd
+.sized:
+    push ebx
+    cmp ebx, A_BROWSE
+    jne .o
+    call browser_resize
+.o:
+    pop eax
+    jmp open
+
+ctx_close:
+    and dword [esi+WVIS], 0
+    ret
+
+show_desktop:
+    mov esi, wins
+    mov ecx, NWIN
+.l:
+    cmp dword [esi+WVIS], 1
+    jne .n
+    pushad
+    call minimize
+    popad
+.n:
+    add esi, WSIZE
+    loop .l
+    ret
+
+;esi = string, action pairs
+ctx_show:
+    mov [ctx_arg], eax
+    mov [ctx_items], esi
+    xor ecx, ecx
+.c:
+    cmp dword [esi+ecx*8], 0
+    je .h
+    inc ecx
+    jmp .c
+.h:
+    imul ecx, 28
+    add ecx, 8
+    mov [ctx_h], ecx
+    mov eax, [mx]
+    mov ebx, WIDTH-CTXW
+    cmp eax, ebx
+    cmova eax, ebx
+    mov [ctx_x], eax
+    mov eax, [my]
+    mov ebx, BARY
+    sub ebx, ecx
+    cmp eax, ebx
+    cmova eax, ebx
+    mov [ctx_y], eax
+    ret
+
+ctx_hit:
+    xor esi, esi
+    mov eax, [mx]
+    sub eax, [ctx_x]
+    cmp eax, CTXW
+    jae .x
+    mov eax, [my]
+    sub eax, [ctx_y]
+    sub eax, 4
+    cmp eax, [ctx_h]
+    jae .x
+    xor edx, edx
+    mov ecx, 28
+    div ecx
+    mov esi, [ctx_items]
+    lea esi, [esi+eax*8]
+    cmp dword [esi], 0
+    jne .x
+    xor esi, esi
+.x:
+    ret
+
+draw_ctx:
+    cmp dword [ctx_items], 0
+    je .x
+    call ctx_hit
+    push esi
+    mov eax, [ctx_x]
+    mov ebx, [ctx_y]
+    mov ecx, CTXW
+    mov edx, [ctx_h]
+    add eax, 4
+    add ebx, 5
+    call shade
+    sub eax, 4
+    sub ebx, 5
+    mov esi, 0x8A90A8
+    call rbox
+    inc eax
+    inc ebx
+    sub ecx, 2
+    sub edx, 2
+    mov esi, 0xFBFAF7
+    call rbox
+    mov ebp, [ctx_items]
+    dec eax
+    add ebx, 3
+.i:
+    cmp dword [ebp], 0
+    je .done
+    mov edx, 0x20243A
+    cmp dword [ebp+4], 0
+    jne .on
+    mov edx, 0x6A7088
+    jmp .t
+.on:
+    cmp ebp, [esp]
+    jne .t
+    pushad
+    add eax, 4
+    mov ecx, CTXW-8
+    mov edx, 28
+    mov esi, 0x2F6BFF
+    mov edi, 0x7A3CF0
+    call rgrad
+    popad
+    mov edx, 0xFFFFFF
+.t:
+    add eax, 16
+    add ebx, 6
+    mov esi, [ebp]
+    call text
+    sub eax, 16
+    add ebx, 22
+    add ebp, 8
+    jmp .i
+.done:
+    pop esi
+.x:
+    ret
+
+; qemu acpi off
+shutdown:
+    mov dx, 0x604
+    mov ax, 0x2000
+    out dx, ax
+.h:
+    hlt
+    jmp .h
+
+key:
+    cmp al, 0xE0                            ;ignore e0 prefix
+    je .out
+    mov [lastscan], al                  ;games read this
+    movzx ebx, al
+    and ebx, 0x7F
+    mov ecx, 1
+    test al, 0x80	; release?
+    jz .st
+    xor ecx, ecx
+.st:
+    mov [keys+ebx], cl
+    cmp ebx, 0x2A
+    je .sh
+    cmp ebx, 0x36
+    je .sh
+    test al, 0x80
+    jnz .out
+    xor eax, eax
+    cmp ebx, 0x0E
+    je .bs
+    cmp ebx, 0x1C
+    je .nl
+    cmp ebx, 0x39
+    ja .send
+    mov al, [keymap+ebx]
+    test al, al
+    jz .send
+    cmp dword [shift], 0
+    je .send
+    cmp al, 'a'
+    jb .sym
+    cmp al, 'z'
+    ja .sym
+    sub al, 32
+    jmp .send
+.sym:
+    mov esi, shiftmap
+.sl:
+    mov ah, [esi]
+    test ah, ah
+    jz .sc
+    cmp ah, al
+    je .sf
+    add esi, 2
+    jmp .sl
+.sf:
+    mov al, [esi+1]
+.sc:
+    xor ah, ah
+    jmp .send
+.nl:
+    mov al, 10
+    jmp .send
+.bs:
+    mov al, 8
+.send:
+    movzx ecx, byte [zord+NWIN-1]
+    imul edx, ecx, WSIZE
+    cmp dword [wins+edx+WVIS], 1
+    jne .out
+    mov dword [dirty], 1
+    jmp [appkey+ecx*4]
+.sh:
+    mov [shift], ecx
+.out:
+    ret
+
+;bcd: ah tens, al ones
+cmos:
+    out 0x70, al
+    in al, 0x71
+    mov ah, al
+    shr ah, 4
+    and al, 15
+    ret
+
+clock_tick:
+    mov al, 2		; minutes
+    call cmos
+    movzx ebx, al
+    movzx ecx, ah
+    cmp ebx, [lastmin]
+    je .same
+    mov [lastmin], ebx
+    add cl, '0'
+    add bl, '0'
+    mov [clock+3], cl
+    mov [clock+4], bl
+    mov al, 4                       ; hours
+    call cmos
+    add ah, '0'
+    add al, '0'
+    mov [clock], ah
+    mov [clock+1], al
+    mov dword [dirty], 1
+.same:
+    ret
+
+rand:
+    imul eax, [seed], 1103515245
+    add eax, 12345
+    mov [seed], eax
+    shr eax, 16
+    ret
+
+itoa:
+    push ebx
+    push ecx
+    push edx
+    mov esi, numbuf+15
+    mov byte [esi], 0
+    mov ebx, 10
+    xor ecx, ecx
+    test eax, eax
+    jns .l
+    neg eax
+    inc ecx
+.l:
+    xor edx, edx
+    div ebx
+    add dl, '0'
+    dec esi
+    mov [esi], dl
+    test eax, eax
+    jnz .l
+    test ecx, ecx
+    jz .x
+    dec esi
+    mov byte [esi], '-'
+.x:
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+;case insensitive
+strcmp:
+    push esi
+    push edi
+.l:
+    mov al, [esi]
+    mov ah, [edi]
+    test al, al
+    jz .e
+    or ax, 0x2020
+.e:
+    cmp al, ah
+    jne .x
+    test al, al
+    jz .x
+    inc esi
+    inc edi
+    jmp .l
+.x:
+    pop edi
+    pop esi
+    ret
+
+lerp:
+    push ebx
+    push ecx
+    push edx
+    push edi
+    xor edi, edi
+    xor ecx, ecx
+.c:
+    mov eax, [g_c2]
+    shr eax, cl
+    and eax, 255
+    mov ebx, [g_c1]
+    shr ebx, cl
+    and ebx, 255
+    sub eax, ebx
+    imul eax, ebp
+    cdq
+    idiv dword [g_h]
+    add eax, ebx
+    and eax, 255
+    shl eax, cl
+    or edi, eax
+    add cl, 8
+    cmp cl, 24
+    jb .c
+    mov eax, edi
+    pop edi
+    pop edx
+    pop ecx
+    pop ebx
+    ret
+
+; le=nothing to draw
+clip:
+    cmp eax, 0
+    jge .a
+    add ecx, eax
+    xor eax, eax
+.a:
+    cmp ebx, 0
+    jge .b
+    add edx, ebx
+    xor ebx, ebx
+.b:
+    lea edi, [eax+ecx]
+    cmp edi, WIDTH
+    jle .c
+    mov ecx, WIDTH
+    sub ecx, eax
+.c:
+    lea edi, [ebx+edx]
+    cmp edi, HEIGHT
+    jle .d
+    mov edx, HEIGHT
+    sub edx, ebx
+.d:
+    imul edi, ebx, WIDTH
+    add edi, eax
+    lea edi, [BACK+edi*4]
+    cmp ecx, 0
+    jle .x
+    cmp edx, 0
+.x:
+    ret
+
+rect:
+    pushad
+    call clip
+    jle .x
+    mov eax, esi
+.y:
+    push ecx
+    push edi
+    rep stosd
+    pop edi
+    pop ecx
+    add edi, WIDTH*4
+    dec edx
+    jnz .y
+.x:
+    popad
+    ret
+
+; 3/4
+shade:
+    pushad
+    call clip
+    jle .x
+.y:
+    push ecx
+    push edi
+.p:
+    mov eax, [edi]
+    mov ebx, eax
+    shr eax, 1
+    and eax, 0x7F7F7F
+    shr ebx, 2
+    and ebx, 0x3F3F3F
+    add eax, ebx
+    stosd
+    dec ecx
+    jnz .p
+    pop edi
+    pop ecx
+    add edi, WIDTH*4
+    dec edx
+    jnz .y
+.x:
+    popad
+    ret
+
+; g_round: 1 top corners,2 all
+grad:
+    pushad
+    mov [g_x], eax
+    mov [g_y], ebx
+    mov [g_w], ecx
+    mov [g_h], edx
+    mov [g_c1], esi
+    mov [g_c2], edi
+    xor ebp, ebp
+.l:
+    cmp ebp, [g_h]
+    jge .x
+    call lerp
+    mov esi, eax
+    xor edi, edi
+    cmp dword [g_round], 0
+    je .draw
+    cmp ebp, 5
+    jae .bot
+    movzx edi, byte [rnd+ebp]
+.bot:
+    cmp dword [g_round], 2
+    jne .draw
+    mov eax, [g_h]
+    dec eax
+    sub eax, ebp
+    cmp eax, 5
+    jae .draw
+    movzx edi, byte [rnd+eax]
+.draw:
+    mov eax, [g_x]
+    add eax, edi
+    mov ebx, [g_y]
+    add ebx, ebp
+    mov ecx, [g_w]
+    sub ecx, edi
+    sub ecx, edi
+    mov edx, 1
+    call rect
+    inc ebp
+    jmp .l
+.x:
+    popad
+    ret
+
+rbox:
+    push edi
+    mov edi, esi
+    call rgrad
+    pop edi
+    ret
+
+rgrad:
+    mov dword [g_round], 2
+    call grad
+    and dword [g_round], 0
+    ret
+
+; ebp 1=48px, 2=24px
+cicon:
+    pushad
+    mov ecx, 48
+    cmp ebp, 1
+    je .t
+    shr ecx, 1
+.t:
+    mov edx, ecx
+    mov esi, [iconc+edi*4]
+    push edi
+    mov edi, esi
+    shr edi, 1
+    and edi, 0x7F7F7F
+    call rgrad
+    pop edi
+    shl edi, 5
+    add edi, iconbits
+    mov esi, 8
+    cmp ebp, 1
+    je .o
+    shr esi, 1
+.o:
+    add eax, esi
+    add ebx, esi
+    neg ebp
+    add ebp, 3
+    call bitmap
+    popad
+    ret
+
+bitmap:
+    pushad
+    mov ecx, 16
+.row:
+    push ecx
+    push eax
+    mov dx, [edi]
+    add edi, 2
+    mov ecx, 16
+.col:
+    shl dx, 1
+    jnc .n
+    pushad
+    mov ecx, ebp
+    mov edx, ebp
+    mov esi, 0xFFFFFF
+    call rect
+    popad
+.n:
+    add eax, ebp
+    loop .col
+    pop eax
+    pop ecx
+    add ebx, ebp
+    loop .row
+    popad
+    ret
+
+;make the bios font proportional
+font_init:
+    mov esi, FONT
+    xor edi, edi
+.c:
+    xor ebx, ebx
+    mov ecx, 16
+.o:
+    lodsb
+    or bl, al
+    loop .o
+    mov eax, 0x0400
+    test bl, bl
+    jz .s
+    bsr ecx, ebx
+    bsf edx, ebx
+    mov al, 7
+    sub al, cl
+    mov ah, cl
+    sub ah, dl
+    add ah, 2
+.s:
+    mov [FW+edi*2], ax
+    inc edi
+    cmp edi, 256
+    jb .c
+    ret
+
+text:
+    pushad
+.n:
+    movzx ecx, byte [esi]
+    jecxz .x
+    movzx edi, byte [FW+ecx*2]
+    sub eax, edi
+    call glyph
+    add eax, edi
+    movzx edi, byte [FW+ecx*2+1]
+    add eax, edi
+    inc esi
+    jmp .n
+.x:
+    popad
+    ret
+
+twidth:
+    push ecx
+    push esi
+    xor eax, eax
+.n:
+    movzx ecx, byte [esi]
+    jecxz .x
+    movzx ecx, byte [FW+ecx*2+1]
+    add eax, ecx
+    inc esi
+    jmp .n
+.x:
+    pop esi
+    pop ecx
+    ret
+
+glyph:
+    pushad
+    mov [t_x], eax
+    shl ecx, 4
+    lea esi, [ecx+FONT]
+    mov ebp, 16
+.row:
+    lodsb
+    cmp ebx, HEIGHT
+    jae .next
+    mov cl, al
+    mov edi, [t_x]
+    mov ch, 8
+.b:
+    test cl, 0x80
+    jz .s
+    cmp edi, WIDTH
+    jae .s
+    imul eax, ebx, WIDTH
+    add eax, edi
+    mov [BACK+eax*4], edx
+.s:
+    shl cl, 1
+    inc edi
+    dec ch
+    jnz .b
+.next:
+    inc ebx
+    dec ebp
+    jnz .row
+    popad
+    ret
+
+wallpaper:
+    xor ebp, ebp
+    mov dword [g_h], HEIGHT
+    mov dword [g_c1], 0x0D1228
+    mov dword [g_c2], 0x132E4B
+    mov edi, WALL
+.sky:
+    mov eax, [g_c2]
+    call lerp
+    mov ecx, WIDTH
+    rep stosd
+    inc ebp
+    cmp ebp, HEIGHT
+    jl .sky
+
+    ; central halo
+    mov ebp, -230
+.halo_y:
+    mov ecx, -230
+.halo_x:
+    mov eax, ecx
+    imul eax, ecx
+    mov edx, ebp
+    imul edx, ebp
+    add eax, edx
+    cmp eax, 52900
+    ja .halo_next
+    mov ebx, 0x15294A
+    cmp eax, 44100
+    ja .halo_outer
+    cmp eax, 40000
+    ja .halo_paint
+    cmp eax, 32400
+    ja .halo_mid
+    cmp eax, 28900
+    ja .halo_ring
+    mov ebx, 0x183B5D
+    jmp .halo_paint
+.halo_mid:
+    mov ebx, 0x19375A
+    jmp .halo_paint
+.halo_ring:
+    mov ebx, 0x347FA1
+    jmp .halo_paint
+.halo_outer:
+    mov ebx, 0x253D70
+.halo_paint:
+    mov eax, ebp
+    add eax, 384
+    imul eax, WIDTH
+    lea edx, [ecx+512]
+    add eax, edx
+    mov [WALL+eax*4], ebx
+.halo_next:
+    inc ecx
+    cmp ecx, 230
+    jle .halo_x
+    inc ebp
+    cmp ebp, 230
+    jle .halo_y
+
+    ; small stars
+    mov ebp, 160
+.star:
+    call rand
+    and eax, WIDTH-1
+    mov [cl_cx], eax
+    call rand
+    and eax, HEIGHT-1
+    mov [cl_cy], eax
+    imul eax, [cl_cy], WIDTH
+    add eax, [cl_cx]
+    mov dword [WALL+eax*4], 0x9BCBE8
+    dec ebp
+    jnz .star
+
+    ; logo shadow, then the bright title
+    mov dword [logo_x], 341
+    mov dword [logo_y], 353
+    mov dword [logo_color], 0x0A162C
+    call draw_wall_logo
+    mov dword [logo_x], 337
+    mov dword [logo_y], 349
+    mov dword [logo_color], 0xEAF7FF
+    call draw_wall_logo
+    ret
+
+draw_wall_logo:
+    pushad
+    mov dword [logo_char], 0
+.char:
+    cmp dword [logo_char], 6
+    jae .done
+    mov dword [logo_row], 0
+.row:
+    cmp dword [logo_row], 7
+    jae .next_char
+    mov eax, [logo_char]
+    imul eax, 7
+    add eax, [logo_row]
+    movzx eax, byte [logo_font+eax]
+    mov [logo_bits], eax
+    mov dword [logo_col], 0
+.col:
+    cmp dword [logo_col], 5
+    jae .next_row
+    mov ecx, 4
+    sub ecx, [logo_col]
+    mov eax, [logo_bits]
+    shr eax, cl
+    test al, 1
+    jz .next_col
+    mov eax, [logo_char]
+    imul eax, 60
+    mov ebx, [logo_col]
+    imul ebx, 10
+    add eax, ebx
+    add eax, [logo_x]
+    mov [dot_x], eax
+    mov eax, [logo_row]
+    imul eax, 10
+    add eax, [logo_y]
+    mov [dot_y], eax
+    mov eax, [logo_color]
+    mov [dot_color], eax
+    call wallpaper_dot
+.next_col:
+    inc dword [logo_col]
+    jmp .col
+.next_row:
+    inc dword [logo_row]
+    jmp .row
+.next_char:
+    inc dword [logo_char]
+    jmp .char
+.done:
+    popad
+    ret
+
+wallpaper_dot:
+    pushad
+    mov eax, [dot_y]
+    imul eax, WIDTH
+    add eax, [dot_x]
+    lea edi, [WALL+eax*4]
+    mov ebp, 10
+.row:
+    mov eax, [dot_color]
+    mov ecx, 10
+    rep stosd
+    add edi, (WIDTH-10)*4
+    dec ebp
+    jnz .row
+    popad
+    ret
+
+logo_font:
+    db 0x0E,0x11,0x10,0x10,0x10,0x11,0x0E ; C
+    db 0x00,0x0E,0x01,0x0F,0x11,0x13,0x0D ; a
+    db 0x04,0x00,0x0C,0x04,0x04,0x14,0x08 ; j
+    db 0x00,0x0E,0x11,0x11,0x11,0x11,0x0E ; o
+    db 0x0E,0x11,0x11,0x11,0x11,0x11,0x0E ; O
+    db 0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E ; S
+
+window:
+    pushad
+    mov ebp, eax
+    imul eax, WSIZE
+    lea esi, [wins+eax]
+    cmp dword [esi+WVIS], 1
+    jne .x
+    mov [cur], esi
+    mov eax, [esi+WX]
+    mov ebx, [esi+WY]
+    mov ecx, [esi+WW]
+    mov edx, [esi+WH]
+    add eax, 5
+    add ebx, 6
+    call shade
+    add eax, 3
+    add ebx, 3
+    call shade
+    sub eax, 8
+    sub ebx, 9
+    mov esi, 0x20243A
+    call rbox
+    inc eax
+    inc ebx
+    sub ecx, 2
+    sub edx, 2
+    mov esi, 0xF6F4F0
+    call rbox
+    movzx edi, byte [zord+NWIN-1]
+    cmp edi, ebp
+    jne .inact
+    mov esi, 0x2F6BFF
+    mov edi, 0x7A3CF0
+    jmp .tb
+.inact:
+    mov esi, 0x9094A8
+    mov edi, 0x70748C
+.tb:
+    mov edx, 27
+    mov dword [g_round], 1
+    call grad
+    and dword [g_round], 0
+    mov esi, [cur]
+    mov edx, 0xFFFFFF
+    add eax, 10
+    add ebx, 4
+    mov esi, [esi+WTITLE]
+    call text
+    mov eax, 27
+    mov ecx, 9
+    mov esi, 0xE5484D
+    call tbtn
+    mov esi, [cur]
+    mov ecx, [esi+WMAX]
+    add ecx, 10
+    mov eax, 49
+    mov esi, 0x5A63A8
+    call tbtn
+    mov eax, 71
+    mov ecx, 12
+    call tbtn
+    mov esi, [cur]
+    mov eax, [esi+WX]
+    add eax, 6
+    mov [cx0], eax
+    mov ebx, [esi+WY]
+    add ebx, 30
+    mov [cy0], ebx
+    call [appdraw+ebp*4]
+.x:
+    popad
+    ret
+
+tbtn:
+    pushad
+    mov edi, [cur]
+    neg eax
+    add eax, [edi+WX]
+    add eax, [edi+WW]
+    mov ebx, [edi+WY]
+    add ebx, 5
+    mov edi, ecx
+    mov ecx, 19
+    mov edx, ecx
+    call rbox
+    add eax, 5
+    add ebx, 5
+    shl edi, 5
+    add edi, iconbits
+    mov ebp, 1
+    call bitmap
+    popad
+    ret
+
+icons:
+    xor ebp, ebp
+.i:
+    push ebp
+    mov eax, 24
+    imul ebx, ebp, 78
+    add ebx, 12
+    mov edi, ebp
+    mov ebp, 1
+    call cicon
+    pop ebp
+    mov esi, [titles+ebp*4]
+    call twidth
+    shr eax, 1
+    neg eax
+    add eax, 48
+    add ebx, 52
+    inc eax
+    inc ebx
+    mov edx, 0x000000
+    call text
+    dec eax
+    dec ebx
+    mov edx, 0xFFFFFF
+    call text
+    inc ebp
+    cmp ebp, NWIN
+    jb .i
+    ret
+
+taskbar:
+    xor eax, eax
+    mov ebx, BARY
+    mov ecx, WIDTH
+    mov edx, HEIGHT-BARY
+    mov esi, 0x2A2F52
+    mov edi, 0x12142C
+    call grad
+    mov eax, 6
+    mov ebx, BARY+6
+    mov ecx, 92
+    mov edx, 28
+    mov esi, 0x35C98A
+    mov edi, 0x128A5A
+    cmp dword [menu], 0
+    je .sb
+    xchg esi, edi
+.sb:
+    call rgrad
+    add eax, 30
+    add ebx, 5
+    mov esi, s_start
+    mov edx, 0xFFFFFF
+    call text
+    xor ebp, ebp
+    and dword [t_y], 0
+.t:
+    imul edx, ebp, WSIZE
+    cmp dword [wins+edx+WVIS], 0
+    je .n
+    imul eax, [t_y], 94
+    add eax, 112
+    inc dword [t_y]
+    mov ebx, BARY+6
+    mov ecx, 90
+    mov edx, 28
+    mov esi, 0x3C4270
+    movzx edi, byte [zord+NWIN-1]
+    cmp edi, ebp
+    jne .tb
+    mov esi, 0x5A63A8
+.tb:
+    call rbox
+    add eax, 10
+    add ebx, 5
+    mov esi, [titles+ebp*4]
+    mov edx, 0xFFFFFF
+    call text
+.n:
+    inc ebp
+    cmp ebp, NWIN
+    jb .t
+    mov eax, WIDTH-52
+    mov ebx, BARY+11
+    mov esi, clock
+    mov edx, 0xFFFFFF
+    call text
+    ret
+
+startmenu:
+    cmp dword [menu], 0
+    je .x
+    xor eax, eax
+    mov ebx, MENUY
+    mov ecx, MENUW
+    mov edx, MENUH
+    mov esi, 0xF6F4F0
+    call rect
+    mov edx, 56
+    mov esi, 0x2F6BFF
+    mov edi, 0x7A3CF0
+    call grad
+    add eax, 16
+    add ebx, 19
+    mov esi, s_name
+    mov edx, 0xFFFFFF
+    call text
+    xor ebp, ebp
+.i:
+    imul ebx, ebp, 36
+    add ebx, MENUY+56
+    mov eax, [my]
+    sub eax, ebx
+    cmp eax, 36
+    jae .nh
+    cmp dword [mx], MENUW
+    jae .nh
+    xor eax, eax
+    mov ecx, MENUW
+    mov edx, 36
+    mov esi, 0xCFD8FF
+    call rect
+.nh:
+    cmp ebp, NWIN
+    jae .lbl
+    push ebp
+    mov eax, 12
+    add ebx, 6
+    mov edi, ebp
+    mov ebp, 2
+    call cicon
+    pop ebp
+    sub ebx, 6
+.lbl:
+    mov eax, 48
+    add ebx, 9
+    mov esi, [titles+ebp*4]
+    mov edx, 0x20243A
+    call text
+    inc ebp
+    cmp ebp, NWIN+1
+    jb .i
+.x:
+    ret
+
+cursor:
+    mov esi, arrow
+    xor ebp, ebp
+.r:
+    xor ecx, ecx
+.c:
+    mov al, [esi]
+    inc esi
+    cmp al, '.'
+    je .n
+    mov edx, 0x000000
+    cmp al, 'X'
+    je .p
+    mov edx, 0xFFFFFF
+.p:
+    mov eax, [mx]
+    add eax, ecx
+    cmp eax, WIDTH
+    jae .n
+    mov ebx, [my]
+    add ebx, ebp
+    cmp ebx, HEIGHT
+    jae .n
+    imul ebx, WIDTH
+    add ebx, eax
+    mov [BACK+ebx*4], edx
+.n:
+    inc ecx
+    cmp ecx, 11
+    jb .c
+    inc ebp
+    cmp ebp, 16
+    jb .r
+    ret
+
+scene:
+    mov esi, WALL
+    mov edi, BACK
+    mov ecx, WIDTH*HEIGHT
+    rep movsd
+    call icons
+    xor ecx, ecx
+.w:
+    movzx eax, byte [zord+ecx]
+    call window
+    inc ecx
+    cmp ecx, NWIN
+    jb .w
+    call taskbar
+    call startmenu
+    call draw_ctx
+    call cursor
+    xor eax, eax
+    xor ebx, ebx
+    mov ecx, WIDTH
+    mov edx, HEIGHT
+    jmp blit
+
+%include "fs.inc"
+%include "apps.inc"
+%include "vm.inc"
+%include "net.inc"
+%include "browser.inc"
+%include "crypto.inc"
+%include "tls.inc"
+
+mx      dd 512
+my      dd 384
+btn     dd 0
+midx    dd 0
+mpsz    dd 3
+imps    db 0xF3, 200, 0xF3, 100, 0xF3, 80, 0 ; wheel knock
+mpkt    db 0, 0, 0, 0
+drag    dd -1
+dragx   dd 0
+dragy   dd 0
+menu    dd 0
+ctx_items dd 0
+co_on   dd 0
+co_sp   dd 0
+co_job  dd 0
+co_tick dd 0
+netirq  dd 0
+ctx_arg dd 0
+ctx_x   dd 0
+ctx_y   dd 0
+ctx_h   dd 0
+cl_cx   dd 0
+cl_cy   dd 0
+dirty   dd 0
+gdirty  dd 0
+shift   dd 0
+lastmin dd 99
+lastc   dd 0
+tacc    dd 0
+seed    dd 0x13572468
+cur     dd 0
+cx0     dd 0
+cy0     dd 0
+t_x     dd 0
+t_y     dd 0
+g_x     dd 0
+g_y     dd 0
+g_w     dd 0
+g_h     dd 1
+g_c1    dd 0
+g_c2    dd 0
+g_round dd 0
+logo_x dd 0
+logo_y dd 0
+logo_color dd 0
+logo_char dd 0
+logo_row dd 0
+logo_col dd 0
+logo_bits dd 0
+dot_x dd 0
+dot_y dd 0
+dot_color dd 0
+rnd     db 5, 3, 2, 1, 1
+numbuf  times 16 db 0
+keys    times 128 db 0
+zord    db 1, 2, 3, 4, 5, 6, 7, 0		; last = top
+pcolor  dd 0x20243A
+swatches dd 0x20243A, 0xE5484D, 0xF0A020, 0x35C98A, 0x2F6BFF, 0xFFFFFF
+clock   db '00:00', 0
+
+wins:
+    dd 150, 60, 440, 230, 1, s_sys, 0
+    dd 230, 120, 636, 420, 0, s_term, 0
+    dd 300, 170, 452, 340, 0, s_note, 0
+    dd 120, 150, 372, 420, 0, s_files, 0
+    dd 660, 100, 248, 330, 0, s_calc, 0
+    dd 200, 70, 652, 436, 0, s_snake, 0
+    dd 420, 90, 434, 346, 0, s_paint, 0
+    dd 140, 40, 740, 560, 0, s_browse, 0
+
+titles  dd s_sys, s_term, s_note, s_files, s_calc, s_snake, s_paint, s_browse, s_off
+appdraw dd draw_sys, draw_term, draw_note, draw_files, draw_calc, draw_vm, draw_paint, draw_browser
+appclick dd nop_app, nop_app, click_note, click_files, click_calc, click_vm, nop_app, click_browser
+appmenu dd m_win, m_term, m_note, 0, m_win, m_win, m_paint, m_browse
+; string, action. < NWIN=open app
+m_term  dd s_clear, c_clear
+m_win   dd s_min, minimize, s_fullscr, maximize, s_close, ctx_close, 0
+m_icon  dd s_open, open, s_close, ctx_close, 0
+m_desk  dd s_term, A_TERM, s_note, A_NOTE, s_files, A_FILES, s_snake, A_SNAKE, s_browse, A_BROWSE, s_off, shutdown, 0
+m_bar   dd s_desk, show_desktop, s_off, shutdown, 0
+m_note  dd s_save, note_save, s_new, note_new, s_close, ctx_close, 0
+m_paint dd s_clear, paint_clear, s_close, ctx_close, 0
+m_browse dd s_goback, browser_back, s_reload, start_load, s_close, ctx_close, 0
+m_file  dd s_open, note_open, s_rename, file_rename, s_delete, file_delete, 0
+m_folder dd s_rename, file_rename, 0
+m_files_bg dd s_newfile, file_new, s_newfolder, folder_new, 0
+m_rename dd s_rename_prompt, 0, rename_name, 0, 0
+m_create dd s_create_prompt, 0, rename_name, 0, 0
+m_bad   dd s_rename_bad, 0, rename_name, 0, 0
+appkey  dd nop_app, key_term, key_note, key_files, nop_app, key_vm, nop_app, key_browser
+
+s_sys   db 'System', 0
+s_term  db 'Terminal', 0
+s_note  db 'Notepad', 0
+s_files db 'Files', 0
+s_calc  db 'Calculator', 0
+s_snake db 'Cajo Snake', 0
+s_paint db 'Paint', 0
+s_browse db 'Browser', 0
+s_off   db 'Shut down', 0
+s_start db 'Start', 0
+s_open  db 'Open', 0
+s_close db 'Close', 0
+s_min   db 'Minimize', 0
+s_fullscr db 'Full screen', 0
+s_clear db 'Clear', 0
+s_goback db 'Back', 0
+s_reload db 'Reload', 0
+s_desk  db 'Show desktop', 0
+s_rename db 'Rename', 0
+s_delete db 'Delete', 0
+s_newfile db 'New file', 0
+s_newfolder db 'New folder', 0
+s_name  db 'CajoOS', 0
+
+keymap:
+    db 0, 0, '1234567890-=', 0, 0
+    db 'qwertyuiop[]', 0, 0
+    db 'asdfghjkl;', 39, '`', 0, '\'
+    db 'zxcvbnm,./', 0, '*', 0, ' '
+
+shiftmap:
+    db '1!2@3#4$5%6^7&8*9(0)-_=+[{]};:', 39, '"', ',<.>/?\|`~', 0
+
+arrow:
+    db 'X..........'
+    db 'XX.........'
+    db 'XoX........'
+    db 'XooX.......'
+    db 'XoooX......'
+    db 'XooooX.....'
+    db 'XoooooX....'
+    db 'XooooooX...'
+    db 'XoooooooX..'
+    db 'XooooooooX.'
+    db 'XoooooXXXXX'
+    db 'XooXooX....'
+    db 'XoX.XooX...'
+    db 'XX..XooX...'
+    db 'X....XooX..'
+    db '.....XXX...'
+
+iconc   dd 0x2F6BFF, 0x2A2F52, 0xF0A020, 0xE0A020, 0x3A8FE0, 0xF0C040, 0x3AA0E0, 0xD06030, 0xC04A90
+%include "icons.inc"
+%include "bss.inc"
+

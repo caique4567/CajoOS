@@ -1,6 +1,7 @@
 # CajoOS
 
 Um pequeno sistema operacional desktop x86 em Assembly, baseado no [XD OS](https://github.com/eklavya-raj/xdos), do CodingWalaXD. O projeto de referência demonstra um desktop funcional em uma imagem de aproximadamente 19 KB.
+A ISO do sistema operacional tem um arquivo de aproximadamente 1 MB
 
 Esta primeira versão mantém a base técnica do XD OS e troca a identidade visível para **CajoOS**. Inclui desktop gráfico, janelas, terminal, editor de texto, pintura, arquivos, calculadora, navegador, o jogo **Cajo Snake** e um wallpaper próprio com “CajoOS” centralizado. Os jogos da base foram removidos. O código e a licença MIT originais estão incluídos; consulte `LICENSE.md`.
 
